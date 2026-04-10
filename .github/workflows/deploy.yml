@@ -1,0 +1,32 @@
+name: Deploy Gateway to DigitalOcean
+
+on:
+  push:
+    branches: [production_setup]
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USERNAME }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          script: |
+            cd /opt/translation_gateway
+
+            # Pull latest code
+            git pull origin production_setup
+
+            # Rebuild and restart
+            docker compose down
+            docker compose up -d --build
+
+            # Wait and check health
+            sleep 10
+            curl -sf http://localhost:6005/health && echo "Gateway healthy!" || echo "Gateway not ready yet"
+            curl -sf http://localhost:6005/autoscaler/status && echo "Autoscaler OK" || echo "Autoscaler check failed"
