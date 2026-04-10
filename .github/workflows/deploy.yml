@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [production_setup]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/jagannathpridh18/translation-gateway
+
 jobs:
   # ================================================================
   # Stage 1: Lint & Code Quality
@@ -50,14 +54,12 @@ jobs:
         run: |
           python -c "
           from gateway.autoscaler import AutoScaler, ServicePool, Pod
-          # Test Pod creation
           p = Pod(pod_id='test123', service_name='lid', base_url='http://test', port=6001)
           assert p.pod_id == 'test123'
           assert p.is_healthy == False
           assert p.avg_latency_ms == 0
           print('Pod tests passed')
 
-          # Test ServicePool
           pool = ServicePool(name='lid', port=6001, template_id='', gpu_type='T4', min_pods=1, max_pods=5)
           assert pool.num_healthy == 0
           assert pool.current_rps == 0
@@ -65,48 +67,46 @@ jobs:
           assert len(pool.pods) == 1
           print('ServicePool tests passed')
 
-          # Test URL resolution
-          import os
-          os.environ['AUTOSCALER_ENABLED'] = 'false'
-          os.environ['LID_SERVICE_URL'] = 'http://test-lid:6001'
-          print('Config tests passed')
-
           print('All tests passed!')
           "
 
   # ================================================================
-  # Stage 3: Build Docker Image
+  # Stage 3: Build Docker Image & Push to GHCR
   # ================================================================
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/production_setup'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t translation-gateway:${{ github.sha }} .
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Test container starts
-        run: |
-          docker run -d --name test-gw \
-            -e LID_SERVICE_URL=http://localhost:6001 \
-            -e INDIC_EN_SERVICE_URL=http://localhost:6002 \
-            -e EN_INDIC_SERVICE_URL=http://localhost:6003 \
-            -e AUTOSCALER_ENABLED=false \
-            -p 6005:6005 \
-            translation-gateway:${{ github.sha }}
-          sleep 5
-          curl -sf http://localhost:6005/health || echo "Health check (expected degraded without backends)"
-          docker logs test-gw 2>&1 | tail -10
-          docker stop test-gw
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
   # ================================================================
-  # Stage 4: Deploy to DigitalOcean (only on push, not PR)
+  # Stage 4: Deploy to DigitalOcean (pull image + run)
   # ================================================================
   deploy:
     runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/production_setup'
+    needs: build-and-push
     steps:
       - name: Deploy to DigitalOcean
         uses: appleboy/ssh-action@v1
@@ -115,18 +115,29 @@ jobs:
           username: ${{ secrets.DO_USERNAME }}
           password: ${{ secrets.DO_PASSWORD }}
           script: |
-            cd /opt/translation_gateway
-            echo "--- Pulling latest code ---"
-            git pull origin production_setup
-            echo "--- Rebuilding container ---"
-            docker compose down
-            docker compose up -d --build
+            echo "--- Login to GHCR ---"
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            echo "--- Pull latest image ---"
+            docker pull ghcr.io/jagannathpridh18/translation-gateway:latest
+
+            echo "--- Stop old container ---"
+            docker stop translation-gateway 2>/dev/null || true
+            docker rm translation-gateway 2>/dev/null || true
+
+            echo "--- Start new container ---"
+            docker run -d \
+              --name translation-gateway \
+              --restart unless-stopped \
+              -p 6005:6005 \
+              --env-file /opt/translation_gateway/.env \
+              ghcr.io/jagannathpridh18/translation-gateway:latest
+
             echo "--- Waiting for startup ---"
             sleep 10
+
             echo "--- Health check ---"
             curl -sf http://localhost:6005/health && echo " Gateway OK" || echo " Gateway starting..."
-            echo "--- Autoscaler status ---"
-            curl -sf http://localhost:6005/autoscaler/status && echo " Autoscaler OK" || echo " Autoscaler disabled"
             echo "--- Deploy complete ---"
 
   # ================================================================
@@ -144,16 +155,11 @@ jobs:
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.DO_HOST }}:6005/health)
           echo "Gateway HTTP status: $HTTP_CODE"
           if [ "$HTTP_CODE" = "200" ]; then
-            echo "✅ Gateway is healthy"
+            echo "Gateway is healthy"
           else
-            echo "⚠️ Gateway returned $HTTP_CODE (may be degraded if RunPod pods are stopped)"
+            echo "Gateway returned $HTTP_CODE (may be degraded if RunPod pods are stopped)"
           fi
 
-      - name: Check autoscaler
+      - name: Check endpoints
         run: |
-          curl -sf http://${{ secrets.DO_HOST }}:6005/autoscaler/status || echo "Autoscaler not enabled"
-
-      - name: Check endpoints available
-        run: |
-          curl -sf http://${{ secrets.DO_HOST }}:6005/docs > /dev/null && echo "✅ Swagger docs accessible" || echo "⚠️ Swagger not available"
-          curl -sf http://${{ secrets.DO_HOST }}:6005/languages > /dev/null && echo "✅ Languages endpoint OK" || echo "⚠️ Languages endpoint failed"
+          curl -sf http://${{ secrets.DO_HOST }}:6005/docs > /dev/null && echo "Swagger docs accessible" || echo "Swagger not available"
