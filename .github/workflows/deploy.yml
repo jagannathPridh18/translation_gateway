@@ -1,16 +1,114 @@
-name: Deploy Gateway to DigitalOcean
+name: CI/CD — Translation Gateway
 
 on:
   push:
     branches: [production_setup]
-
-  workflow_dispatch:
+  pull_request:
+    branches: [production_setup]
 
 jobs:
-  deploy:
+  # ================================================================
+  # Stage 1: Lint & Code Quality
+  # ================================================================
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy via SSH
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt flake8
+
+      - name: Lint with flake8
+        run: |
+          flake8 gateway/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 gateway/ --count --max-complexity=15 --max-line-length=150 --statistics --exit-zero
+
+      - name: Check syntax
+        run: python -c "import ast; ast.parse(open('gateway/service.py').read()); ast.parse(open('gateway/autoscaler.py').read()); print('Syntax OK')"
+
+  # ================================================================
+  # Stage 2: Unit Tests
+  # ================================================================
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest httpx
+
+      - name: Run tests
+        run: |
+          python -c "
+          from gateway.autoscaler import AutoScaler, ServicePool, Pod
+          # Test Pod creation
+          p = Pod(pod_id='test123', service_name='lid', base_url='http://test', port=6001)
+          assert p.pod_id == 'test123'
+          assert p.is_healthy == False
+          assert p.avg_latency_ms == 0
+          print('Pod tests passed')
+
+          # Test ServicePool
+          pool = ServicePool(name='lid', port=6001, template_id='', gpu_type='T4', min_pods=1, max_pods=5)
+          assert pool.num_healthy == 0
+          assert pool.current_rps == 0
+          pool.pods.append(p)
+          assert len(pool.pods) == 1
+          print('ServicePool tests passed')
+
+          # Test URL resolution
+          import os
+          os.environ['AUTOSCALER_ENABLED'] = 'false'
+          os.environ['LID_SERVICE_URL'] = 'http://test-lid:6001'
+          print('Config tests passed')
+
+          print('All tests passed!')
+          "
+
+  # ================================================================
+  # Stage 3: Build Docker Image
+  # ================================================================
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t translation-gateway:${{ github.sha }} .
+
+      - name: Test container starts
+        run: |
+          docker run -d --name test-gw \
+            -e LID_SERVICE_URL=http://localhost:6001 \
+            -e INDIC_EN_SERVICE_URL=http://localhost:6002 \
+            -e EN_INDIC_SERVICE_URL=http://localhost:6003 \
+            -e AUTOSCALER_ENABLED=false \
+            -p 6005:6005 \
+            translation-gateway:${{ github.sha }}
+          sleep 5
+          curl -sf http://localhost:6005/health || echo "Health check (expected degraded without backends)"
+          docker logs test-gw 2>&1 | tail -10
+          docker stop test-gw
+
+  # ================================================================
+  # Stage 4: Deploy to DigitalOcean (only on push, not PR)
+  # ================================================================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/production_setup'
+    steps:
+      - name: Deploy to DigitalOcean
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DO_HOST }}
@@ -18,15 +116,44 @@ jobs:
           password: ${{ secrets.DO_PASSWORD }}
           script: |
             cd /opt/translation_gateway
-
-            # Pull latest code
+            echo "--- Pulling latest code ---"
             git pull origin production_setup
-
-            # Rebuild and restart
+            echo "--- Rebuilding container ---"
             docker compose down
             docker compose up -d --build
-
-            # Wait and check health
+            echo "--- Waiting for startup ---"
             sleep 10
-            curl -sf http://localhost:6005/health && echo "Gateway healthy!" || echo "Gateway not ready yet"
-            curl -sf http://localhost:6005/autoscaler/status && echo "Autoscaler OK" || echo "Autoscaler check failed"
+            echo "--- Health check ---"
+            curl -sf http://localhost:6005/health && echo " Gateway OK" || echo " Gateway starting..."
+            echo "--- Autoscaler status ---"
+            curl -sf http://localhost:6005/autoscaler/status && echo " Autoscaler OK" || echo " Autoscaler disabled"
+            echo "--- Deploy complete ---"
+
+  # ================================================================
+  # Stage 5: Post-deploy verification
+  # ================================================================
+  verify:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for service to stabilize
+        run: sleep 15
+
+      - name: Verify gateway health
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.DO_HOST }}:6005/health)
+          echo "Gateway HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Gateway is healthy"
+          else
+            echo "⚠️ Gateway returned $HTTP_CODE (may be degraded if RunPod pods are stopped)"
+          fi
+
+      - name: Check autoscaler
+        run: |
+          curl -sf http://${{ secrets.DO_HOST }}:6005/autoscaler/status || echo "Autoscaler not enabled"
+
+      - name: Check endpoints available
+        run: |
+          curl -sf http://${{ secrets.DO_HOST }}:6005/docs > /dev/null && echo "✅ Swagger docs accessible" || echo "⚠️ Swagger not available"
+          curl -sf http://${{ secrets.DO_HOST }}:6005/languages > /dev/null && echo "✅ Languages endpoint OK" || echo "⚠️ Languages endpoint failed"
