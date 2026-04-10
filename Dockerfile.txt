@@ -1,0 +1,42 @@
+# API Gateway (Port 6005)
+# Lightweight routing service — no ML models, no GPU
+
+# --- Stage 1: Builder ---
+FROM python:3.10-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY gateway/requirements.md /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# --- Stage 2: Runtime ---
+FROM python:3.10-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    SERVICE_PORT=6005
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+RUN groupadd -g 1000 app && useradd -u 1000 -g app -m app
+WORKDIR /app
+
+COPY --chown=app:app gateway/ ./gateway/
+
+RUN mkdir -p /app/logs && chown -R app:app /app
+
+USER app
+EXPOSE 6005
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:6005/health || exit 1
+
+CMD ["python", "-m", "gateway.service"]
