@@ -555,12 +555,12 @@ def log_json_entry(data: Dict[str, Any]) -> None:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://localhost:6001")
-INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "http://localhost:6002")
-EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "http://localhost:6003")
-# LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://165.232.178.107:6001")
-# INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "https://tpo8k3tqbvj39o-6002.proxy.runpod.net")
-# EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "https://5uv9ga9wwrrtzg-6003.proxy.runpod.net")
+# LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://localhost:6001")
+# INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "http://localhost:6002")
+# EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "http://localhost:6003")
+LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://165.232.178.107:6001")
+INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "https://tpo8k3tqbvj39o-6002.proxy.runpod.net")
+EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "https://5uv9ga9wwrrtzg-6003.proxy.runpod.net")
 SERVICE_PORT = int(os.environ.get("SERVICE_PORT", "6005"))
 
 # Short code mappings
