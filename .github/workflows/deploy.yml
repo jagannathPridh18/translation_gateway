@@ -2,9 +2,9 @@ name: CI/CD — Translation Gateway
 
 on:
   push:
-    branches: [production_setup]
+    branches: [main]
   pull_request:
-    branches: [production_setup]
+    branches: [main]
 
 jobs:
   # ================================================================
@@ -97,19 +97,19 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/production_setup'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Deploy to DigitalOcean
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USERNAME }}
-          password: ${{ secrets.DO_PASSWORD }}
+          key: ${{ secrets.DO_SSH_KEY }}
           script: |
             cd /opt/translation_gateway
 
             echo "=== Pulling latest code ==="
-            git pull origin production_setup
+            git pull origin main
 
             echo "=== Rebuilding container ==="
             docker compose down
