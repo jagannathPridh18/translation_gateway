@@ -104,7 +104,7 @@ jobs:
         with:
           host: ${{ secrets.DO_HOST }}
           username: ${{ secrets.DO_USERNAME }}
-          password: ${{ secrets.DO_PASSWORD }}
+          key: ${{ secrets.DO_SSH_KEY }}
           script: |
             cd /opt/translation_gateway
 
