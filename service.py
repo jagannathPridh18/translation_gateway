@@ -555,9 +555,12 @@ def log_json_entry(data: Dict[str, Any]) -> None:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://0.0.0.0:6001")
-INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "http://0.0.0.0:6002")
-EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "http://0.0.0.0:6003")
+LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://localhost:6001")
+INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "http://localhost:6002")
+EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "http://localhost:6003")
+# LID_SERVICE_URL = os.environ.get("LID_SERVICE_URL", "http://165.232.178.107:6001")
+# INDIC_EN_SERVICE_URL = os.environ.get("INDIC_EN_SERVICE_URL", "https://tpo8k3tqbvj39o-6002.proxy.runpod.net")
+# EN_INDIC_SERVICE_URL = os.environ.get("EN_INDIC_SERVICE_URL", "https://5uv9ga9wwrrtzg-6003.proxy.runpod.net")
 SERVICE_PORT = int(os.environ.get("SERVICE_PORT", "6005"))
 
 # Short code mappings
@@ -570,6 +573,7 @@ SHORT_TO_INDICTRANS = {
 }
 
 INDICTRANS_TO_SHORT = {v: k for k, v in SHORT_TO_INDICTRANS.items()}
+_INDICTRANS2_VALID_CODES = set(SHORT_TO_INDICTRANS.values())
 
 # Language code normalization (handles various formats from LID)
 # Maps detected language codes to standard IndicTrans2 codes
@@ -706,6 +710,67 @@ def normalize_language_code(lang_code: str) -> str:
     return lang_code
 
 
+# Unicode script ranges → IndicTrans2 language code
+# Used as a zero-dependency fallback when the LID service is unavailable.
+# For scripts shared by multiple languages (e.g. Devanagari), returns the
+# most common language; the translation model handles disambiguation.
+SCRIPT_RANGES = [
+    (0x0C00, 0x0C7F, "tel_Telu"),    # Telugu
+    (0x0C80, 0x0CFF, "kan_Knda"),    # Kannada
+    (0x0D00, 0x0D7F, "mal_Mlym"),    # Malayalam
+    (0x0B80, 0x0BFF, "tam_Taml"),    # Tamil
+    (0x0980, 0x09FF, "ben_Beng"),    # Bengali / Assamese
+    (0x0A00, 0x0A7F, "pan_Guru"),    # Gurmukhi (Punjabi)
+    (0x0A80, 0x0AFF, "guj_Gujr"),    # Gujarati
+    (0x0B00, 0x0B7F, "ory_Orya"),    # Odia
+    (0x0900, 0x097F, "hin_Deva"),    # Devanagari (Hindi / Marathi / others)
+    (0x0600, 0x06FF, "urd_Arab"),    # Arabic script (Urdu / Kashmiri / Sindhi)
+    (0x0750, 0x077F, "urd_Arab"),    # Arabic supplement
+    (0xABC0, 0xABFF, "mni_Mtei"),    # Meetei Mayek (Manipuri)
+]
+
+
+def detect_language_from_script(text: str) -> Optional[str]:
+    """
+    Detect language from Unicode script of characters.
+    
+    Simple, reliable fallback for native-script text when the LID service
+    is unavailable. Returns an IndicTrans2 language code or None.
+    """
+    if not text:
+        return None
+    
+    # Count characters per script
+    script_counts: Dict[str, int] = {}
+    total_alpha = 0
+    
+    for ch in text:
+        cp = ord(ch)
+        for start, end, lang_code in SCRIPT_RANGES:
+            if start <= cp <= end:
+                script_counts[lang_code] = script_counts.get(lang_code, 0) + 1
+                total_alpha += 1
+                break
+        else:
+            # Check if it's a Latin letter (English / Roman)
+            if ch.isalpha() and cp < 0x0250:
+                script_counts["eng_Latn"] = script_counts.get("eng_Latn", 0) + 1
+                total_alpha += 1
+    
+    if not script_counts or total_alpha == 0:
+        return None
+    
+    # Return the dominant script language
+    dominant_lang = max(script_counts, key=script_counts.get)
+    dominant_ratio = script_counts[dominant_lang] / total_alpha
+    
+    # Only return if dominant script is a clear majority (>60%)
+    if dominant_ratio > 0.6:
+        return dominant_lang
+    
+    return None
+
+
 def is_roman_script(lid_result: dict) -> bool:
     """Check if the detected script is Roman/Latin"""
     # Check translit_info for Roman detection
@@ -790,6 +855,81 @@ def simplify_response(full_response: dict) -> dict:
         return {"output": outputs[0]}
     
     return {"output": outputs}
+
+
+def _build_skip_response(
+    sentences: List[str],
+    src_lang: str,
+    tgt_lang: str,
+    t_start: float
+) -> dict:
+    """
+    Build a response that returns input as-is when detected/source language
+    matches the target language — no translation needed.
+    """
+    translations = []
+    for idx, sentence in enumerate(sentences):
+        translations.append({
+            "id": idx + 1,
+            "input": sentence,
+            "language": src_lang,
+            "target_language": tgt_lang,
+            "translated": sentence,
+            "final": sentence,
+            "preprocessing": {
+                "skipped": True,
+                "reason": "detected_language_matches_target",
+                "detected_language": src_lang,
+            },
+            "entity_comparison": {},
+            "entity_fixes": []
+        })
+    
+    return {
+        "translations": translations,
+        "direction": f"{src_lang} → {tgt_lang} (no-op)",
+        "source_lang_detected": src_lang,
+        "target_lang_code": tgt_lang,
+        "skipped": True,
+        "time_seconds": 0.0,
+        "gateway_time_seconds": round(time.time() - t_start, 3)
+    }
+
+
+def _resolve_src_lang_from_lid(
+    lid_results: Optional[List[dict]],
+    sentences: List[str]
+) -> str:
+    """
+    Resolve source language from LID results, falling back to Unicode
+    script detection. Never returns 'auto'.
+    
+    Returns an IndicTrans2 language code (e.g. 'tel_Telu') or 'auto' only
+    as an absolute last resort.
+    """
+    # Try LID results first
+    if lid_results:
+        for r in lid_results:
+            detected = r.get("detected_language", "")
+            if detected:
+                normalized = normalize_language_code(detected)
+                if normalized and normalized.lower() not in ("auto", "unknown", ""):
+                    return normalized
+            # Also try translit_info fasttext_label
+            translit = r.get("translit_info", {})
+            ft_label = translit.get("fasttext_label", "")
+            if ft_label:
+                mapped = LID_TO_INDICTRANS.get(ft_label)
+                if mapped:
+                    return mapped
+    
+    # Fall back to Unicode script detection
+    combined = " ".join(sentences) if sentences else ""
+    script_lang = detect_language_from_script(combined)
+    if script_lang:
+        return script_lang
+    
+    return "auto"
 
 
 # ============================================================================
@@ -921,6 +1061,11 @@ async def translate(req: TranslateRequest):
         # Need to detect language first, then decide
         full_result = await _translate_with_lid_check(request_id, sentences, src_lang, tgt_lang, is_auto, req, t_start)
     
+    elif src_lang == tgt_lang:
+        # Explicit same-language: skip translation, return input as-is
+        logger.info(f"[{request_id}] [SKIP] src_lang == tgt_lang ({src_lang}), returning input as-is")
+        full_result = _build_skip_response(sentences, src_lang, tgt_lang, t_start)
+    
     else:
         raise HTTPException(status_code=400, detail="Please select a valid source and target language")
     
@@ -963,6 +1108,11 @@ async def translate_detailed(req: TranslateRequest):
     elif is_auto or src_lang != tgt_lang:
         return await _translate_with_lid_check(request_id, sentences, src_lang, tgt_lang, is_auto, req, t_start)
     
+    elif src_lang == tgt_lang:
+        # Explicit same-language: skip translation, return input as-is
+        logger.info(f"[{request_id}] [SKIP] src_lang == tgt_lang ({src_lang}), returning input as-is")
+        return _build_skip_response(sentences, src_lang, tgt_lang, t_start)
+    
     else:
         raise HTTPException(status_code=400, detail="Please select a valid source and target language")
 
@@ -974,15 +1124,35 @@ async def _call_lid_service(sentences: List[str], src_lang_hint: Optional[str] =
         if src_lang_hint and src_lang_hint not in ("auto", "Auto", "AUTO"):
             payload["src_lang_hint"] = src_lang_hint
         
+        logger.info(f"Calling LID service at {LID_SERVICE_URL}/batch_process with {len(sentences)} sentences")
+        
         lid_response = await http_client.post(
             f"{LID_SERVICE_URL}/batch_process",
             json=payload,
             timeout=30.0
         )
         lid_response.raise_for_status()
-        return lid_response.json().get("results", [])
+        lid_data = lid_response.json()
+        
+        results = lid_data.get("results", [])
+        logger.info(f"LID service returned {len(results)} results (keys in response: {list(lid_data.keys())})")
+        
+        # If "results" key is empty, try other common keys
+        if not results:
+            for alt_key in ["predictions", "output", "data", "detections"]:
+                results = lid_data.get(alt_key, [])
+                if results:
+                    logger.info(f"LID results found under key '{alt_key}' instead of 'results'")
+                    break
+        
+        if not results:
+            logger.warning(f"LID response had no results. Full response keys: {list(lid_data.keys())}, "
+                          f"response preview: {json.dumps(lid_data, ensure_ascii=False)[:500]}")
+        
+        return results if results else None
+        
     except Exception as e:
-        logger.warning(f"LID service unavailable: {e}")
+        logger.error(f"LID service call FAILED: {type(e).__name__}: {e}")
         return None
 
 
@@ -1020,20 +1190,33 @@ async def _translate_with_lid_check(
     
     for idx, (sentence, lid_result) in enumerate(zip(sentences, lid_results)):
         detected_lang = lid_result.get("detected_language", "")
-        translit_info = lid_result.get("translit_info", {})
+        translit_info = lid_result.get("translit_info", {}) or {}
         processed_text = lid_result.get("processed_text", sentence)
-        
+
+        # Fallback resolution when LID couldn't assign a language — use
+        # fasttext_label, then per-sentence Unicode script detection.
+        if not detected_lang:
+            ft_label = translit_info.get("fasttext_label", "")
+            mapped = LID_TO_INDICTRANS.get(ft_label) if ft_label else None
+            if not mapped and ft_label in _INDICTRANS2_VALID_CODES:
+                mapped = ft_label
+            if not mapped:
+                mapped = detect_language_from_script(sentence)
+            if mapped:
+                detected_lang = mapped
+                lid_result["detected_language"] = mapped  # persist for downstream
+
         # Check if this is Roman script
         is_roman = is_roman_script(lid_result)
-        
+
         # Check if detected language matches target language
         lang_matches = languages_match(detected_lang, tgt_lang)
         
         logger.debug(f"[{request_id}] Sentence {idx}: detected={detected_lang}, target={tgt_lang}, "
                     f"is_roman={is_roman}, lang_matches={lang_matches}")
         
-        if is_roman and lang_matches:
-            # SHORTCUT: Same language, just need transliteration
+        if lang_matches and is_roman:
+            # SHORTCUT: Roman script, same language → return transliterated text
             transliterated_text = translit_info.get("transliterated_text", "") or processed_text
             
             logger.info(f"[{request_id}] [SHORTCUT] Sentence {idx}: Roman {detected_lang} → {tgt_lang} "
@@ -1043,6 +1226,18 @@ async def _translate_with_lid_check(
                 "idx": idx,
                 "input": sentence,
                 "output": transliterated_text,
+                "lid_result": lid_result,
+                "shortcut_applied": True
+            })
+        elif lang_matches and not is_roman:
+            # SKIP: Native script, same language → return input as-is
+            logger.info(f"[{request_id}] [SKIP] Sentence {idx}: native {detected_lang} == target {tgt_lang} "
+                       f"(already in target language, no translation needed)")
+            
+            transliteration_only.append({
+                "idx": idx,
+                "input": sentence,
+                "output": sentence,
                 "lid_result": lid_result,
                 "shortcut_applied": True
             })
@@ -1091,9 +1286,12 @@ async def _translate_with_lid_check(
     if not transliteration_only:
         logger.info(f"[{request_id}] No transliteration shortcuts, proceeding with translation")
         
+        # Resolve src_lang from LID results
+        resolved = _resolve_src_lang_from_lid(lid_results, sentences)
+        
         if tgt_lang == "eng_Latn":
             return await _translate_indic_to_english_with_lid(
-                request_id, sentences, lid_results, req, t_start
+                request_id, sentences, lid_results, resolved, req, t_start
             )
         else:
             return await _translate_indic_to_indic_with_lid(
@@ -1108,9 +1306,12 @@ async def _translate_with_lid_check(
     translation_sentences = [item["sentence"] for item in needs_translation]
     translation_lid_results = [item["lid_result"] for item in needs_translation]
     
+    # Resolve src_lang from LID results of sentences needing translation
+    resolved = _resolve_src_lang_from_lid(translation_lid_results, translation_sentences)
+    
     if tgt_lang == "eng_Latn":
         trans_result = await _translate_indic_to_english_with_lid(
-            request_id, translation_sentences, translation_lid_results, req, t_start
+            request_id, translation_sentences, translation_lid_results, resolved, req, t_start
         )
     else:
         trans_result = await _translate_indic_to_indic_with_lid(
@@ -1167,14 +1368,52 @@ async def _translate_indic_to_english(
     req: TranslateRequest,
     t_start: float
 ) -> dict:
-    """Route to Indic → English service"""
+    """Route to Indic → English service.
+    
+    CRITICAL: This function always resolves the source language before
+    calling the translation service. It never sends src_lang='auto'.
+    
+    Resolution order:
+      1. LID service (best quality)
+      2. Unicode script detection (zero-dependency fallback)
+      3. Explicit src_lang from the user (if not auto)
+    """
     lid_results = None
+    resolved_src_lang = src_lang  # may still be "auto" here
     
     if is_auto:
+        # ── Step 1: Try LID service ──
         lid_results = await _call_lid_service(sentences)
+        logger.info(f"[{request_id}] LID results received: {lid_results is not None}")
+        
+        if lid_results:
+            # Extract detected language from first result
+            first_detected = lid_results[0].get("detected_language", "")
+            normalized = normalize_language_code(first_detected)
+            if normalized and normalized != first_detected:
+                logger.info(f"[{request_id}] LID detected: {first_detected} → normalized: {normalized}")
+            if normalized:
+                resolved_src_lang = normalized
+        
+        # ── Step 2: If LID failed, fall back to Unicode script detection ──
+        if resolved_src_lang in ("auto", "Auto", "AUTO"):
+            combined_text = " ".join(sentences)
+            script_lang = detect_language_from_script(combined_text)
+            if script_lang:
+                resolved_src_lang = script_lang
+                logger.info(f"[{request_id}] [SCRIPT-FALLBACK] Unicode script detection: {script_lang}")
+            else:
+                logger.warning(f"[{request_id}] Could not detect language via LID or script detection")
+    
+    # ── Same-language skip: if resolved lang == target (eng_Latn), return as-is ──
+    if languages_match(resolved_src_lang, "eng_Latn"):
+        logger.info(f"[{request_id}] [SKIP] Detected English, same as target eng_Latn — skipping translation")
+        return _build_skip_response(sentences, resolved_src_lang, "eng_Latn", t_start)
+    
+    logger.info(f"[{request_id}] Sending to translation service with src_lang={resolved_src_lang}")
     
     return await _translate_indic_to_english_with_lid(
-        request_id, sentences, lid_results, req, t_start
+        request_id, sentences, lid_results, resolved_src_lang, req, t_start
     )
 
 
@@ -1182,14 +1421,19 @@ async def _translate_indic_to_english_with_lid(
     request_id: str,
     sentences: List[str],
     lid_results: Optional[List[dict]],
+    resolved_src_lang: str,
     req: TranslateRequest,
     t_start: float
 ) -> dict:
-    """Translate Indic → English with pre-fetched LID results"""
+    """Translate Indic → English with pre-resolved source language.
+    
+    Always sends an explicit src_lang to the translation service.
+    Falls back to fasttext-based retry if the first attempt still fails.
+    """
     try:
         payload = {
             "sentences": sentences,
-            "src_lang": "auto",
+            "src_lang": resolved_src_lang,
             "num_beams": req.num_beams,
             "max_new_tokens": req.max_new_tokens
         }
@@ -1198,11 +1442,21 @@ async def _translate_indic_to_english_with_lid(
             payload["lid_results"] = [
                 {
                     "processed_text": r.get("processed_text"),
-                    "detected_language": r.get("detected_language"),
+                    # Patch with resolved_src_lang when LID could not resolve
+                    # a language code — otherwise the downstream service will
+                    # treat the sentence as "unknown" and skip translation.
+                    "detected_language": (
+                        normalize_language_code(r.get("detected_language"))
+                        if r.get("detected_language")
+                        else resolved_src_lang
+                    ),
                     "translit_info": r.get("translit_info")
                 }
                 for r in lid_results
             ]
+        
+        logger.info(f"[{request_id}] Calling translation service: src_lang={resolved_src_lang}, "
+                    f"has_lid_results={lid_results is not None}")
         
         response = await http_client.post(
             f"{INDIC_EN_SERVICE_URL}/batch_translate",
@@ -1211,6 +1465,53 @@ async def _translate_indic_to_english_with_lid(
         )
         response.raise_for_status()
         result = response.json()
+        
+        # ── Last-resort fallback: if translation service STILL fails ──
+        # Extract fasttext_label from its response and retry
+        translations = result.get("translations", [])
+        has_detection_failure = any(
+            t.get("preprocessing", {}).get("language_detection_failed", False)
+            for t in translations
+        )
+        
+        if has_detection_failure:
+            resolved_lang = None
+            for t in translations:
+                preproc = t.get("preprocessing", {})
+                if preproc.get("language_detection_failed"):
+                    translit = preproc.get("transliteration", {})
+                    ft_label = translit.get("fasttext_label", "")
+                    ft_conf = translit.get("fasttext_confidence", 0)
+                    
+                    if ft_label and ft_conf > 0.5:
+                        mapped = LID_TO_INDICTRANS.get(ft_label)
+                        if mapped and mapped != "eng_Latn" and mapped != resolved_src_lang:
+                            resolved_lang = mapped
+                            logger.info(
+                                f"[{request_id}] [FASTTEXT-FALLBACK] Detection failed with "
+                                f"src_lang={resolved_src_lang}, but fasttext found '{ft_label}' "
+                                f"(conf={ft_conf:.4f}). Retrying with src_lang={mapped}."
+                            )
+                            break
+            
+            if resolved_lang:
+                retry_payload = {
+                    "sentences": sentences,
+                    "src_lang": resolved_lang,
+                    "num_beams": req.num_beams,
+                    "max_new_tokens": req.max_new_tokens
+                }
+                retry_response = await http_client.post(
+                    f"{INDIC_EN_SERVICE_URL}/batch_translate",
+                    json=retry_payload,
+                    timeout=60.0
+                )
+                retry_response.raise_for_status()
+                result = retry_response.json()
+                result["fallback_applied"] = True
+                result["fallback_src_lang"] = resolved_lang
+                logger.info(f"[{request_id}] [FASTTEXT-FALLBACK] Retry succeeded with src_lang={resolved_lang}")
+        
         result["gateway_time_seconds"] = round(time.time() - t_start, 3)
         return result
         
@@ -1288,8 +1589,9 @@ async def _translate_indic_to_indic_with_lid(
 ) -> dict:
     """Route Indic → Indic translation with pre-fetched LID results"""
     # Step 1: Indic → English
+    resolved = _resolve_src_lang_from_lid(lid_results, sentences)
     step1_result = await _translate_indic_to_english_with_lid(
-        request_id, sentences, lid_results, req, t_start
+        request_id, sentences, lid_results, resolved, req, t_start
     )
     
     # Extract English translations
