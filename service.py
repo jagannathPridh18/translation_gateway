@@ -1215,6 +1215,14 @@ async def _translate_with_lid_check(
         logger.debug(f"[{request_id}] Sentence {idx}: detected={detected_lang}, target={tgt_lang}, "
                     f"is_roman={is_roman}, lang_matches={lang_matches}")
         
+        logger.info(
+            f"[{request_id}] Sentence {idx}: detected={detected_lang}, "
+            f"normalized={normalize_language_code(detected_lang)}, "
+            f"target={tgt_lang}, is_roman={is_roman}, "
+            f"lang_matches={lang_matches}, "
+            f"translit_info={translit_info}"
+        )
+        
         if lang_matches and is_roman:
             # SHORTCUT: Roman script, same language → return transliterated text
             transliterated_text = translit_info.get("transliterated_text", "") or processed_text
